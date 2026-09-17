@@ -1,6 +1,6 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Services;
+namespace CocomediaNL\LaravelWebhostingDeploy\Services;
 
 use Illuminate\Support\Facades\Process;
 

@@ -1,37 +1,30 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Commands;
+namespace CocomediaNL\LaravelWebhostingDeploy\Commands;
 
 use Illuminate\Support\Facades\File;
 
-class SetupAutomatedDeployCommand extends BaseDirectAdminCommand
+use function Laravel\Prompts\confirm;
+
+class SetupAutomatedDeployCommand extends BaseWebhostingCommand
 {
-    /**
-     * The name and signature of the console command.
-     */
-    protected $signature = 'directadmin:setup-cicd 
+    protected $signature = 'webhosting:setup-cicd
                             {--token= : GitHub Personal Access Token}
                             {--branch= : Override default branch}
                             {--php-version= : Override PHP version}';
 
-    /**
-     * The console command description.
-     */
     protected $description = 'Setup automated deployment (publishes workflow file and creates secrets)';
 
-    /**
-     * Execute the console command.
-     */
+    protected $aliases = ['directadmin:setup-cicd'];
+
     public function handle(): int
     {
         $this->info('🚀 Setting up automated deployment via GitHub API...');
 
-        // Validate configuration
         if (! $this->validateConfiguration()) {
             return self::FAILURE;
         }
 
-        // Get repository information
         $repoInfo = $this->getRepositoryInfo();
         if (! $repoInfo) {
             $this->error('❌ Could not detect repository information. Please run this command from a Git repository.');
@@ -41,16 +34,13 @@ class SetupAutomatedDeployCommand extends BaseDirectAdminCommand
 
         $this->info("📦 Repository: {$repoInfo['owner']}/{$repoInfo['name']}");
 
-        // Initialize GitHub API
         $apiInitialized = $this->initializeGitHubAPI(null, true);
         if (! $apiInitialized) {
             return self::FAILURE;
         }
 
-        // Setup SSH connection
         $this->setupSshConnection();
 
-        // Test SSH connection
         if (! $this->ssh->testConnection()) {
             $this->error('❌ SSH connection failed. Please check your SSH configuration.');
 
@@ -59,25 +49,21 @@ class SetupAutomatedDeployCommand extends BaseDirectAdminCommand
 
         $this->info('✅ SSH connection successful');
 
-        // Setup SSH keys on server
         if (! $this->setupSshKeys(true)) {
             $this->error('❌ Failed to setup SSH keys');
 
             return self::FAILURE;
         }
 
-        // Check if GitHub API is available for automated setup
         if ($this->githubAPI) {
-            // Automated setup via API
             $publicKey = $this->ssh->getPublicKey();
             if ($publicKey) {
                 $this->addDeployKeyViaAPI($publicKey, $repoInfo);
             }
 
-            // Get SSH information
-            $sshHost = config('directadmin-deploy.ssh.host');
-            $sshUsername = config('directadmin-deploy.ssh.username');
-            $sshPort = config('directadmin-deploy.ssh.port', 22);
+            $sshHost = (string) config('webhosting-deploy.ssh.host');
+            $sshUsername = (string) config('webhosting-deploy.ssh.username');
+            $sshPort = (int) config('webhosting-deploy.ssh.port', 22);
             $privateKey = $this->ssh->getPrivateKey();
 
             if (! $privateKey) {
@@ -86,40 +72,33 @@ class SetupAutomatedDeployCommand extends BaseDirectAdminCommand
                 return self::FAILURE;
             }
 
-            // Create workflow file
             if (! $this->createWorkflowFile($repoInfo)) {
                 return self::FAILURE;
             }
 
-            // Get site directory
-            $siteDir = $this->getSiteDir();
-
-            // Create secrets (including WEBSITE_FOLDER)
-            if (! $this->createSecrets($repoInfo, $sshHost, $sshUsername, $sshPort, $privateKey, $siteDir)) {
+            if (! $this->createSecrets($repoInfo, $sshHost, $sshUsername, $sshPort, $privateKey)) {
                 return self::FAILURE;
             }
 
             $this->line('');
             $this->info('✅ Automated deployment setup completed successfully!');
         } else {
-            // Manual setup - display secrets and deploy key
-            // Create workflow file
             if (! $this->createWorkflowFile($repoInfo)) {
                 return self::FAILURE;
             }
 
-            // Display all secrets and deploy key for manual setup
             $this->displayGitHubSecrets($repoInfo);
 
-            // Display next steps
+            $workflowFile = config('webhosting-deploy.github.workflow_file', '.github/workflows/webhosting-deploy.yml');
+
             $this->line('');
             $this->info('✅ Setup completed! Next steps:');
             $this->line('');
             $this->line('1. Add all the secrets shown above to GitHub');
             $this->line('2. Add the deploy key to your repository');
             $this->line('3. Commit and push the workflow file:');
-            $this->line('      git add .github/workflows/directadmin-deploy.yml');
-            $this->line('      git commit -m "Add DirectAdmin deployment workflow"');
+            $this->line("      git add {$workflowFile}");
+            $this->line('      git commit -m "Add webhosting deployment workflow"');
             $this->line('      git push');
             $this->line('4. Your repository will automatically deploy on push!');
             $this->line('');
@@ -128,51 +107,42 @@ class SetupAutomatedDeployCommand extends BaseDirectAdminCommand
         return self::SUCCESS;
     }
 
-    /**
-     * Publish workflow file locally.
-     */
     protected function createWorkflowFile(array $repoInfo): bool
     {
         try {
             $this->info('📄 Publishing GitHub Actions workflow file locally...');
 
-            // Get branch
-            $branch = $this->option('branch') ?: $this->github->getCurrentBranch() ?: config('directadmin-deploy.github.default_branch', 'main');
-            $phpVersion = $this->option('php-version') ?: config('directadmin-deploy.github.php_version', '8.3');
+            $branch = $this->option('branch') ?: $this->github->getCurrentBranch() ?: config('webhosting-deploy.github.default_branch', 'main');
+            $phpVersion = $this->option('php-version') ?: config('webhosting-deploy.github.php_version', '8.3');
 
-            // Get workflow file path
-            $workflowFile = config('directadmin-deploy.github.workflow_file', '.github/workflows/directadmin-deploy.yml');
+            $workflowFile = config('webhosting-deploy.github.workflow_file', '.github/workflows/webhosting-deploy.yml');
 
-            // Create .github/workflows directory if it doesn't exist
             $workflowDir = dirname($workflowFile);
             if (! File::exists($workflowDir)) {
                 File::makeDirectory($workflowDir, 0755, true);
                 $this->info("📁 Created directory: {$workflowDir}");
             }
 
-            // Check if file already exists
             if (File::exists($workflowFile)) {
-                if (! $this->confirm("Workflow file already exists at {$workflowFile}. Overwrite it?", true)) {
+                if (! confirm("Workflow file already exists at {$workflowFile}. Overwrite it?", true)) {
                     $this->warn('⚠️  Skipping workflow file creation. Using existing file.');
 
                     return true;
                 }
             }
 
-            // Generate workflow content
             $workflowContent = $this->generateWorkflowContent($branch, $phpVersion);
 
-            // Write workflow file
             if (File::put($workflowFile, $workflowContent)) {
                 $this->info("✅ Workflow file published: {$workflowFile}");
                 $this->warn('⚠️  Please review the workflow file, commit it, and push to trigger deployments.');
 
                 return true;
-            } else {
-                $this->error("❌ Failed to create workflow file: {$workflowFile}");
-
-                return false;
             }
+
+            $this->error("❌ Failed to create workflow file: {$workflowFile}");
+
+            return false;
         } catch (\Exception $e) {
             $this->error('❌ Failed to create workflow file: '.$e->getMessage());
 
@@ -180,10 +150,7 @@ class SetupAutomatedDeployCommand extends BaseDirectAdminCommand
         }
     }
 
-    /**
-     * Create secrets via GitHub API.
-     */
-    protected function createSecrets(array $repoInfo, string $sshHost, string $sshUsername, int $sshPort, string $sshKey, string $siteDir): bool
+    protected function createSecrets(array $repoInfo, string $sshHost, string $sshUsername, int $sshPort, string $sshKey): bool
     {
         try {
             $this->info('🔒 Creating GitHub secrets...');
@@ -193,7 +160,7 @@ class SetupAutomatedDeployCommand extends BaseDirectAdminCommand
                 'SSH_USERNAME' => $sshUsername,
                 'SSH_PORT' => (string) $sshPort,
                 'SSH_KEY' => $sshKey,
-                'WEBSITE_FOLDER' => $siteDir,
+                'APP_PATH' => $this->driver()->relativeAppPath(),
             ];
 
             foreach ($secrets as $name => $value) {

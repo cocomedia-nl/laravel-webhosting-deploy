@@ -1,150 +1,135 @@
-# Laravel DirectAdmin Deploy
+# Laravel Webhosting Deploy
 
-Originally inspired by laravel-hostinger-deploy by TheCodeholic
+Deploy a Laravel application to shared webhosting (DirectAdmin or TransIP) over SSH, with optional GitHub Actions.
 
-Deploy your Laravel application to DirectAdmin shared hosting with automated GitHub Actions support.
+Originally inspired by laravel-hostinger-deploy by TheCodeholic. Previously published as `cocomedia-nl/laravel-directadmin-deploy`.
 
 ## Installation
 
-Install the package via Composer:
+```bash
+composer require cocomedia-nl/laravel-webhosting-deploy --dev
+```
+
+This package is a development dependency: it is only needed on your machine (and in CI setup), not on the production server.
+
+## Quick start
 
 ```bash
-composer require cocomedia-nl/laravel-directadmin-deploy:^0.1 --dev
+php artisan webhosting:deploy-and-setup-cicd
 ```
 
-Or install the latest version:
+A [Laravel Prompts](https://laravel.com/framework/docs/prompts) wizard asks:
 
-```bash
-composer require cocomedia-nl/laravel-directadmin-deploy --dev
-```
+1. **Target** — DirectAdmin or TransIP
+2. **SSH** — host, username, port
+3. **DirectAdmin** — website folder (`domains/{site}/laravel_html`)
+4. **TransIP** — confirmation that the control panel DocumentRoot is `/www/public`
+5. **APP_URL**
+6. **Database** — SQLite or MySQL (MySQL credentials are written to the **remote** `.env` only)
+7. Whether to run migrations
 
-> **Note:** This package should be installed as a development dependency (`--dev`) since it's only needed during deployment, not in production.
+The command then deploys the app, writes local `WEBHOSTING_*` settings, creates GitHub secrets (`SSH_*` and `APP_PATH`), and publishes `.github/workflows/webhosting-deploy.yml`.
 
-## Required Environment Variables
+Switching from a DirectAdmin test server to TransIP live is the same command: choose TransIP in the wizard. The previous test server can be retired afterwards.
 
-Before using any deployment commands, add these to your `.env` file:
+## Hosting layouts
 
-```env
-DIRECTADMIN_SSH_HOST=your-server-ip
-DIRECTADMIN_SSH_USERNAME=your-username
-DIRECTADMIN_SSH_PORT=22
-DIRECTADMIN_SITE_DIR=your-website-folder
-GITHUB_API_TOKEN=your-github-token
-```
+### DirectAdmin
 
-### SSH Authentication Setup
+- App path: `~/domains/{site}/laravel_html`
+- Creates `public_html` → `laravel_html/public` (this step is **not** run on TransIP)
 
-> **⚠️ Important:** It is **highly recommended** to set up SSH public key authentication on your DirectAdmin server instead of using password authentication. Public key authentication is more secure and eliminates the need to enter passwords during deployments.
->
-> **To set up SSH public key authentication:**
->
-> 1. Generate an SSH key pair on your local machine: `ssh-keygen -t rsa -b 4096`
-> 2. Copy your public key to the server: `ssh-copy-id username@your-server-ip`
-> 3. Test the connection: `ssh username@your-server-ip` (should connect without password prompt)
->
-> Once configured, the deployment commands will use your SSH key automatically, making deployments seamless and secure.
+### TransIP
 
-## Quick Start (All-in-One Command)
+See [Laravel on TransIP webhosting](https://www.transip.nl/knowledgebase/website-algemeen/laravel-installeren-op-een-webhostingpakket) and [DocumentRoot](https://www.transip.nl/knowledgebase/website-algemeen/6605-de-documentroot-van-je-website).
 
-The easiest way to deploy and set up automated deployment:
+- App path: `~/www`
+- **No** `public_html` symlink — set Websitepad / DocumentRoot to `/www/public` in the control panel
+- Create the MySQL database in the control panel before running migrations
 
-```bash
-php artisan directadmin:deploy-and-setup-cicd
-```
+Override the app path with `WEBHOSTING_APP_PATH` (relative to the SSH home directory).
 
-**What this command does:**
+## Commands
 
-1. Deploys your Laravel application to DirectAdmin
-2. Sets up SSH keys on the server
-3. Automatically adds deploy key to GitHub repository via API
-4. Publishes GitHub Actions workflow file locally (`.github/workflows/directadmin-deploy.yml`)
-5. Configures GitHub secrets and variables via API
+| Command | Alias (legacy) | Purpose |
+| --- | --- | --- |
+| `webhosting:test-connection` | `directadmin:test-connection` | Test SSH, inbound server-key login, server Git deploy key, and GitHub API without deploying |
+| `webhosting:deploy-and-setup-cicd` | `directadmin:deploy-and-setup-cicd` | Wizard, deploy, GitHub secrets + workflow |
+| `webhosting:deploy` | `directadmin:deploy` | Deploy only (wizard if SSH settings are missing) |
+| `webhosting:setup-cicd` | `directadmin:setup-cicd` | Publish workflow and GitHub secrets |
+| `webhosting:publish-workflow` | `directadmin:publish-workflow` | Write the workflow file locally |
 
-**Command Options:**
+Useful options:
 
-- `--fresh` - Delete existing files and clone fresh repository
-- `--site-dir=` - Override site directory from config
-- `--token=` - GitHub Personal Access Token (overrides GITHUB_API_TOKEN from .env)
-- `--branch=` - Branch to deploy (default: auto-detect)
-- `--php-version=` - PHP version for workflow (default: 8.3)
+- `--fresh` — delete the remote app directory and clone again
+- `--reconfigure` — run the wizard again
+- `--token=` — GitHub Personal Access Token (or `GITHUB_API_TOKEN` in `.env`)
+- `--branch=` / `--php-version=` — workflow generation
+- `--show-errors` — print SSH/GitHub error output on failure
 
-## Individual Commands
+## Environment variables
 
-### 1. Manual Deployment Only
+The wizard writes these to your **local** `.env`. Existing `DIRECTADMIN_*` keys still work as fallbacks.
 
-```bash
-php artisan directadmin:deploy
-```
+| Variable | Required | Description |
+| --- | --- | --- |
+| `WEBHOSTING_DRIVER` | No (default `directadmin`) | `directadmin` or `transip` |
+| `WEBHOSTING_SSH_HOST` | Yes | SSH hostname or IP |
+| `WEBHOSTING_SSH_USERNAME` | Yes | SSH username |
+| `WEBHOSTING_SSH_PORT` | No (default `22`) | SSH port |
+| `WEBHOSTING_SITE_DIR` | DirectAdmin only | Domain folder name |
+| `WEBHOSTING_APP_PATH` | No | Override remote app path from `$HOME` |
+| `GITHUB_API_TOKEN` | For automated secrets | PAT with Administration + Secrets write |
 
-**What it does:** Deploys your Laravel application to DirectAdmin server (composer install, migrations, storage link, etc.)
+Database credentials are **not** stored locally and are **not** added as GitHub secrets.
 
-**Command Options:**
+## GitHub Actions
 
-- `--fresh` - Delete existing files and clone fresh repository
-- `--site-dir=` - Override site directory from config
-- `--token=` - GitHub Personal Access Token (optional, enables automatic deploy key management)
-- `--show-errors` - Display detailed error messages with exit codes and command output
+Published file: `.github/workflows/webhosting-deploy.yml`
 
-> **Note:** If `GITHUB_API_TOKEN` is provided (via `.env` or `--token` option), the command will automatically add deploy keys to your GitHub repository. Otherwise, you'll be prompted to add the deploy key manually.
+Secrets created by `webhosting:setup-cicd`:
 
----
+- `SSH_HOST`, `SSH_USERNAME`, `SSH_PORT`, `SSH_KEY`
+- `APP_PATH` — relative to home (`domains/example.com/laravel_html` or `www`)
 
-### 2. Create GitHub Actions Workflow File
+Review, commit, and push the workflow yourself. Subsequent pushes deploy with `git reset`, `composer install`, migrate, and cache commands. CI does not recreate the DirectAdmin `public_html` symlink (that happens on the first Artisan deploy).
 
-```bash
-php artisan directadmin:publish-workflow
-```
+## SSH keys
 
-**What it does:** Creates `.github/workflows/directadmin-deploy.yml` file locally
+Two different authorizations are involved:
 
-**Command Options:**
+1. **Outbound (git fetch)** — the server public key as a GitHub deploy key. Setup via API when `GITHUB_API_TOKEN` is set.
+2. **Inbound (GitHub Actions)** — that same key in `authorized_keys`, so CI can SSH in with secret `SSH_KEY`.
 
-- `--branch=` - Branch to trigger deployment (default: auto-detect)
-- `--php-version=` - PHP version for workflow (default: 8.3)
+On **DirectAdmin**, writing `~/.ssh/authorized_keys` is often not enough. sshd may ignore the file (StrictModes with a group-writable home, or a panel-managed key list). Authorize the same public key in DirectAdmin: **Advanced Features → SSH Keys**, with Authorize / Allow login enabled. That panel step cannot be automated without DirectAdmin login credentials, which this package does not store.
 
----
+`webhosting:setup-cicd` and `webhosting:test-connection` verify whether the server key is actually accepted for login, and print the public key plus panel steps when it is not.
 
-### 3. Setup Automated Deployment (Via GitHub API)
-
-```bash
-php artisan directadmin:setup-cicd
-```
-
-**What it does:** Publishes GitHub Actions workflow file locally and creates secrets automatically via GitHub API, and automatically adds deploy keys to your repository
-
-**Command Options:**
-
-- `--token=` - GitHub Personal Access Token (overrides GITHUB_API_TOKEN from .env)
-- `--branch=` - Branch to deploy (default: auto-detect)
-- `--php-version=` - PHP version for workflow (default: 8.3)
-
-**GitHub Personal Access Token Permissions:**
-Your GitHub Personal Access Token needs the following permissions:
-
-- **Administration** → Read and write (for managing deploy keys for the repository)
-- **Metadata** → Read-only (automatically selected, required for API access)
-
-**Note:** The workflow file is published locally to `.github/workflows/directadmin-deploy.yml`. You'll need to review, commit, and push it manually. The command only uses the API to create secrets and deploy keys.
-
-## Environment Variables Summary
-
-| Variable                   | Required For    | Description                                                                       |
-| -------------------------- | --------------- | --------------------------------------------------------------------------------- |
-| `DIRECTADMIN_SSH_HOST`     | All commands    | DirectAdmin server IP address                                                     |
-| `DIRECTADMIN_SSH_USERNAME` | All commands    | DirectAdmin SSH username                                                          |
-| `DIRECTADMIN_SSH_PORT`     | All commands    | SSH port (default: 22)                                                            |
-| `DIRECTADMIN_SITE_DIR`     | All commands    | Website folder name                                                               |
-| `GITHUB_API_TOKEN`         | Automated setup | GitHub Personal Access Token (requires Administration permission for deploy keys) |
+Your local SSH login (password or your own key) is separate from the server key CI uses.
 
 ## Requirements
 
 - PHP ^8.2
-- Laravel ^11.0|^12.0
-- SSH access to DirectAdmin server
+- Laravel ^11 / ^12 / ^13
+- SSH access to the hosting account
 - Git repository (GitHub recommended)
-- **PHP `exec()` function must be enabled** (required for executing SSH commands and process management)
+- PHP `exec()` enabled (used for SSH and process management)
 
-> **Important:** This package requires the PHP `exec()` function to be available and enabled on your system. The `exec()` function is used for executing SSH commands and managing deployment processes. If `exec()` is disabled in your PHP configuration, deployment operations will fail.
+## Migrating from `laravel-directadmin-deploy`
+
+Existing apps that require `cocomedia-nl/laravel-directadmin-deploy` stay on **0.1.8** until you switch. `composer update` will not pick up this package automatically.
+
+Per project:
+
+```bash
+composer remove cocomedia-nl/laravel-directadmin-deploy
+composer require cocomedia-nl/laravel-webhosting-deploy --dev
+```
+
+- `DIRECTADMIN_SSH_*` and `DIRECTADMIN_SITE_DIR` keep working
+- `directadmin:*` Artisan commands remain as aliases
+- Republish the workflow (`php artisan webhosting:publish-workflow` or setup-cicd), then remove `.github/workflows/directadmin-deploy.yml` and `config/directadmin-deploy.php` if you had published them
+- Do not install both packages in the same app
 
 ## License
 

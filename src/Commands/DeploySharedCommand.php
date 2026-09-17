@@ -1,36 +1,38 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Commands;
+namespace CocomediaNL\LaravelWebhostingDeploy\Commands;
 
-class DeploySharedCommand extends BaseDirectAdminCommand
+use CocomediaNL\LaravelWebhostingDeploy\Support\DeployWizard;
+use Illuminate\Support\Facades\Process;
+
+use function Laravel\Prompts\select;
+
+class DeploySharedCommand extends BaseWebhostingCommand
 {
-    /**
-     * The name and signature of the console command.
-     */
-    protected $signature = 'directadmin:deploy 
+    protected $signature = 'webhosting:deploy
                             {--fresh : Delete and clone fresh repository}
                             {--site-dir= : Override site directory from config}
                             {--token= : GitHub Personal Access Token}
-                            {--show-errors : Show detailed error messages}';
+                            {--show-errors : Show detailed error messages}
+                            {--reconfigure : Re-run the deploy setup wizard}
+                            {--skip-wizard : Skip the setup wizard (used by deploy-and-setup-cicd)}';
 
-    /**
-     * The console command description.
-     */
-    protected $description = 'Deploy Laravel application to DirectAdmin shared hosting';
+    protected $description = 'Deploy Laravel application to shared webhosting';
 
-    /**
-     * Execute the console command.
-     */
+    protected $aliases = ['directadmin:deploy'];
+
     public function handle(): int
     {
-        $this->info('🚀 Starting DirectAdmin deployment...');
+        $this->info('🚀 Starting webhosting deployment...');
 
-        // Validate configuration
+        if (! $this->option('skip-wizard')) {
+            $this->runWizard((bool) $this->option('reconfigure'));
+        }
+
         if (! $this->validateConfiguration()) {
             return self::FAILURE;
         }
 
-        // Get repository URL
         $repoUrl = $this->getRepositoryUrl();
         if (! $repoUrl) {
             $this->error('❌ Could not detect Git repository URL. Please run this command from a Git repository.');
@@ -40,13 +42,10 @@ class DeploySharedCommand extends BaseDirectAdminCommand
 
         $this->info("📦 Repository: {$repoUrl}");
 
-        // Initialize GitHub API (optional, for automatic deploy key management)
         $this->initializeGitHubAPI($repoUrl, false);
-
-        // Setup SSH connection
         $this->setupSshConnection();
+        $this->ssh->setTimeout((int) config('webhosting-deploy.ssh.deploy_timeout', 600));
 
-        // Test SSH connection
         if (! $this->ssh->testConnection()) {
             $this->error('❌ SSH connection failed. Please check your SSH configuration.');
 
@@ -55,85 +54,65 @@ class DeploySharedCommand extends BaseDirectAdminCommand
 
         $this->info('✅ SSH connection successful');
 
-        // Build frontend assets if package.json exists
         $this->buildFrontendAssets();
 
-        // Deploy to server
         if (! $this->deployToServer($repoUrl)) {
             $this->error('❌ Deployment failed');
 
             return self::FAILURE;
         }
 
-        // Copy built assets to server
         $this->copyBuiltAssetsToServer();
 
         $this->info('✅ Deployment completed successfully!');
-        $this->info("🌐 Your Laravel application: https://{$this->getSiteDir()}");
+
+        $siteDir = $this->getSiteDir();
+        if ($siteDir !== '') {
+            $this->info("🌐 Your Laravel application: https://{$siteDir}");
+        }
+
+        $hint = $this->driver()->documentRootHint();
+        if ($hint) {
+            $this->info("ℹ️  TransIP DocumentRoot should be {$hint}");
+        }
 
         return self::SUCCESS;
     }
 
-    /**
-     * Deploy application to server.
-     */
     protected function deployToServer(string $repoUrl): bool
     {
-        $siteDir = $this->getSiteDir();
-        $isFresh = $this->option('fresh');
+        $isFresh = (bool) $this->option('fresh');
 
         try {
-            // Setup SSH keys if needed
             $this->setupSshKeysForDeployment();
 
-            // Check folder status and get deployment choice
-            $cloneChoice = $this->getDeploymentChoice($siteDir, $isFresh);
+            $cloneChoice = $this->getDeploymentChoice($isFresh);
 
-            // Prepare deployment commands
-            $commands = $this->buildDeploymentCommands($repoUrl, $siteDir, $cloneChoice);
+            $commands = $this->buildDeploymentCommands($repoUrl, $cloneChoice);
 
-            // Execute deployment
             $this->info('📦 Deploying application...');
             try {
                 $this->ssh->executeMultiple($commands);
-
-                return true;
             } catch (\Exception $e) {
-                // Check if this is a git clone authentication error
                 if ($this->isGitAuthenticationError($e)) {
-                    return $this->handleGitAuthenticationError($repoUrl, $siteDir, $cloneChoice);
+                    return $this->handleGitAuthenticationError($repoUrl, $cloneChoice);
                 }
-                throw $e; // Re-throw if it's not an auth error
-            }
-        } catch (\Exception $e) {
-            // Check if this is a git authentication error that wasn't caught earlier
-            if ($this->isGitAuthenticationError($e)) {
-                return $this->handleGitAuthenticationError($repoUrl, $siteDir, 'clone_direct');
+                throw $e;
             }
 
-            // Show error message
+            $this->configureRemoteEnvironment();
+            $this->runRemoteArtisanSetup();
+
+            return true;
+        } catch (\Exception $e) {
+            if ($this->isGitAuthenticationError($e)) {
+                return $this->handleGitAuthenticationError($repoUrl, 'clone_direct');
+            }
+
             $this->error('❌ Deployment failed.');
             $this->line('');
 
-            // Show actual error details if show-errors flag is set or if error contains useful info
-            $showErrors = $this->option('show-errors');
-            $errorMessage = $e->getMessage();
-
-            if ($showErrors || strpos($errorMessage, 'Error output:') !== false || strpos($errorMessage, 'exit code:') !== false) {
-                $this->warn('📋 Error Details:');
-                $this->line('');
-                // Display the error message, breaking it into lines if it contains newlines
-                $errorLines = explode("\n", $errorMessage);
-                foreach ($errorLines as $line) {
-                    // Highlight exit codes and error outputs
-                    if (strpos($line, 'exit code:') !== false || strpos($line, 'Error output:') !== false) {
-                        $this->line('   ⚠️  '.$line);
-                    } else {
-                        $this->line('   '.$line);
-                    }
-                }
-                $this->line('');
-            }
+            $this->displayExceptionDetails($e);
 
             $this->warn('💡 This might be due to:');
             $this->line('   1. Server connection issues');
@@ -142,7 +121,7 @@ class DeploySharedCommand extends BaseDirectAdminCommand
             $this->line('   4. Command execution failures (composer, git, etc.)');
             $this->line('');
 
-            if (! $showErrors) {
+            if (! $this->option('show-errors')) {
                 $this->info('💡 Tip: Run with --show-errors flag to see detailed error messages.');
                 $this->line('');
             }
@@ -153,17 +132,12 @@ class DeploySharedCommand extends BaseDirectAdminCommand
         }
     }
 
-    /**
-     * Setup SSH keys on server if needed and add deploy key via API if available.
-     * Does not display the key to user - only shows it on actual permission errors.
-     */
     protected function setupSshKeysForDeployment(): void
     {
         if (! $this->setupSshKeys(false)) {
             return;
         }
 
-        // Get public key
         $publicKey = $this->ssh->getPublicKey();
 
         if (! $publicKey) {
@@ -172,31 +146,22 @@ class DeploySharedCommand extends BaseDirectAdminCommand
             return;
         }
 
-        // Try to add deploy key via API if available (silently)
         if ($this->githubAPI) {
-            // Try to add via API, but don't show manual instructions if it fails
-            // The key will be shown only if git clone fails with permission error
             try {
                 $repoInfo = $this->github->getRepositoryInfo();
                 if ($repoInfo) {
                     if ($this->githubAPI->keyExists($repoInfo['owner'], $repoInfo['name'], $publicKey)) {
-                        // Key already exists, nothing to do
                         return;
                     }
-                    // Try to add the key
-                    $this->githubAPI->createDeployKey($repoInfo['owner'], $repoInfo['name'], $publicKey, 'DirectAdmin Server', false);
+                    $this->githubAPI->createDeployKey($repoInfo['owner'], $repoInfo['name'], $publicKey, 'Webhosting Deploy', false);
                 }
             } catch (\Exception $e) {
-                // Silent failure - will be handled if git clone fails
+                // Silent failure — handled if git clone fails
             }
         }
-        // If no API, we'll handle it when git clone fails with permission error
     }
 
-    /**
-     * Check folder status and get deployment choice from user.
-     */
-    protected function getDeploymentChoice(string $siteDir, bool $forceFresh): string
+    protected function getDeploymentChoice(bool $forceFresh): string
     {
         if ($forceFresh) {
             return 'delete_and_clone_direct';
@@ -204,8 +169,7 @@ class DeploySharedCommand extends BaseDirectAdminCommand
 
         $this->info('🔍 Checking website folder...');
 
-        // Check if folder is empty
-        $folderStatus = $this->checkFolderStatus($siteDir);
+        $folderStatus = $this->checkFolderStatus();
 
         if ($folderStatus === 'empty') {
             $this->info('✅ Empty folder - ready to deploy');
@@ -215,186 +179,191 @@ class DeploySharedCommand extends BaseDirectAdminCommand
 
         $this->warn('⚠️  Folder not empty - checking contents...');
 
-        // Check if it's a Laravel project
-        $isLaravel = $this->isLaravelProject($siteDir);
-
-        $fullPath = $this->getAbsoluteSitePath($siteDir);
+        $isLaravel = $this->isLaravelProject();
+        $fullPath = $this->driver()->rsyncAppPath();
 
         if ($isLaravel) {
             $this->info("✅ Found existing Laravel project in: {$fullPath}");
-            $this->line('');
-            $this->line('1. Replace with fresh deployment');
-            $this->line('2. Keep existing and continue');
-            $this->line('');
 
-            $choice = $this->ask('Choose [1/2]', '2');
+            $choice = select(
+                label: 'What should happen to the existing project?',
+                options: [
+                    'skip' => 'Keep existing and continue (update dependencies)',
+                    'delete_and_clone_direct' => 'Replace with a fresh clone',
+                ],
+                default: 'skip'
+            );
 
-            if ($choice === '1') {
-                $this->info('🔄 Will replace existing project');
-
-                return 'delete_and_clone_direct';
-            } else {
-                $this->info('⏭️  Keeping existing project');
-
-                return 'skip';
-            }
-        } else {
-            $this->error("❌ Non-Laravel project detected in: {$fullPath}");
-            $this->line('');
-            $this->line('1. Replace with Laravel project');
-            $this->line('2. Cancel deployment');
-            $this->line('');
-
-            $choice = $this->ask('Choose [1/2]', '2');
-
-            if ($choice === '1') {
-                $this->info('🔄 Will replace with Laravel project');
-
-                return 'delete_and_clone_direct';
-            } else {
-                $this->info('❌ Deployment cancelled');
-                throw new \Exception('Deployment cancelled by user');
-            }
+            return $choice;
         }
+
+        $this->error("❌ Non-Laravel project detected in: {$fullPath}");
+
+        $choice = select(
+            label: 'What should happen?',
+            options: [
+                'cancel' => 'Cancel deployment',
+                'delete_and_clone_direct' => 'Replace with a Laravel project',
+            ],
+            default: 'cancel'
+        );
+
+        if ($choice === 'cancel') {
+            throw new \Exception('Deployment cancelled by user');
+        }
+
+        return $choice;
     }
 
-    /**
-     * Check if the folder is empty or not.
-     */
-    protected function checkFolderStatus(string $siteDir): string
+    protected function checkFolderStatus(): string
     {
-        $absolutePath = $this->getAbsoluteSitePath($siteDir);
+        $path = $this->driver()->shellAppPath();
 
-        // First check if directory exists
-        if (! $this->ssh->directoryExists($absolutePath)) {
-            return 'empty';
-        }
-
-        // Then check if it's empty
-        if ($this->ssh->directoryIsEmpty($absolutePath)) {
-            return 'empty';
-        }
-
-        return 'not_empty';
-    }
-
-    /**
-     * Check if the folder contains a Laravel project.
-     */
-    protected function isLaravelProject(string $siteDir): bool
-    {
-        $absolutePath = $this->getAbsoluteSitePath($siteDir);
-
-        // Check if directory exists
-        if (! $this->ssh->directoryExists($absolutePath)) {
-            return false;
-        }
-
-        // Check for Laravel-specific files
-        $artisanPath = $absolutePath.'/artisan';
-        $composerPath = $absolutePath.'/composer.json';
-
-        if (! $this->ssh->fileExists($artisanPath) || ! $this->ssh->fileExists($composerPath)) {
-            return false;
-        }
-
-        // Check if composer.json contains laravel/framework
         try {
-            // Path is escaped by buildSshCommand, so use single quotes inside
-            $grepCommand = "grep -q 'laravel/framework' '{$composerPath}' 2>/dev/null && echo 'yes' || echo 'no'";
-            $result = trim($this->ssh->execute($grepCommand));
+            $exists = trim($this->ssh->execute("test -d {$path} && echo yes || echo no"));
+            if ($exists !== 'yes') {
+                return 'empty';
+            }
 
-            return trim($result) === 'yes';
+            $result = trim($this->ssh->execute("test -d {$path} && [ -z \"\$(ls -A {$path} 2>/dev/null)\" ] && echo empty || echo not_empty"));
+
+            return $result === 'empty' ? 'empty' : 'not_empty';
+        } catch (\Exception $e) {
+            return 'not_empty';
+        }
+    }
+
+    protected function isLaravelProject(): bool
+    {
+        $path = $this->driver()->shellAppPath();
+
+        try {
+            $exists = trim($this->ssh->execute("test -d {$path} && echo yes || echo no"));
+            if ($exists !== 'yes') {
+                return false;
+            }
+
+            $result = trim($this->ssh->execute(
+                "test -f {$path}/artisan && test -f {$path}/composer.json && grep -q 'laravel/framework' {$path}/composer.json && echo yes || echo no"
+            ));
+
+            return $result === 'yes';
         } catch (\Exception $e) {
             return false;
         }
     }
 
     /**
-     * Build deployment commands.
+     * @return array<int, string>
      */
-    protected function buildDeploymentCommands(string $repoUrl, string $siteDir, string $cloneChoice): array
+    protected function buildDeploymentCommands(string $repoUrl, string $cloneChoice): array
     {
         $commands = [];
-        $absolutePath = $this->getAbsoluteSitePath($siteDir);
-        $username = config('directadmin-deploy.ssh.username');
-        $domainPath = "/home/{$username}/domains/{$siteDir}";
+        $appPath = $this->driver()->shellAppPath();
+        $domainPath = $this->driver()->shellDomainPath();
 
-        // Create site directory structure
-        $commands[] = "mkdir -p {$absolutePath}";
-        $commands[] = "cd {$absolutePath}";
+        $commands[] = "mkdir -p {$appPath}";
+        $commands[] = "cd {$appPath}";
 
-        // Remove existing public_html symlink if exists (at domain root level)
-        $commands[] = "cd {$domainPath}";
-        $commands[] = 'rm -rf public_html';
-        $commands[] = "cd {$absolutePath}";
+        if ($this->driver()->shouldManagePublicHtmlSymlink() && $domainPath) {
+            $publicHtml = $this->driver()->publicHtmlName();
+            $commands[] = "cd {$domainPath}";
+            $commands[] = "rm -rf {$publicHtml}";
+            $commands[] = "cd {$appPath}";
+        }
 
-        // Add Git host to known_hosts to avoid interactive prompt on first clone
-        // This is safe and necessary for automated deployments
         $gitHost = $this->extractGitHost($repoUrl);
         if ($gitHost) {
             $commands[] = 'mkdir -p ~/.ssh';
             $commands[] = 'chmod 700 ~/.ssh';
-            // Escape hostname for security
             $escapedHost = escapeshellarg($gitHost);
             $commands[] = "ssh-keyscan -H {$escapedHost} >> ~/.ssh/known_hosts 2>/dev/null || true";
         }
 
         switch ($cloneChoice) {
             case 'clone_direct':
-                // Fresh deployment - clone directly
                 $commands[] = "git clone {$repoUrl} .";
                 break;
             case 'delete_and_clone_direct':
-                // Replace existing - delete everything and clone
                 $commands[] = 'rm -rf * .[^.]* 2>/dev/null || true';
                 $commands[] = "git clone {$repoUrl} .";
                 break;
             case 'skip':
-                // Keep existing - just update dependencies
+                $commands[] = 'if [ -d .git ]; then git fetch origin && git pull --ff-only || true; fi';
                 break;
             default:
-                // Default: check if repository exists
                 $commands[] = "if [ -d .git ]; then git pull; else git clone {$repoUrl} .; fi";
                 break;
         }
 
-        // Install dependencies
-        $composerFlags = config('directadmin-deploy.deployment.composer_flags', '--no-dev --optimize-autoloader');
+        $composerFlags = config('webhosting-deploy.deployment.composer_flags', '--no-dev --optimize-autoloader');
         $commands[] = "composer install {$composerFlags}";
 
-        // Copy .env.example to .env
-        $commands[] = 'if [ -f .env.example ]; then cp .env.example .env; fi';
+        $commands[] = 'if [ ! -f .env ] && [ -f .env.example ]; then cp .env.example .env; fi';
 
-        // Create symbolic link from domain root public_html to Laravel public folder
-        $commands[] = "cd {$domainPath}";
-        $commands[] = 'ln -s laravel_html/public public_html';
-        $commands[] = "cd {$absolutePath}";
-
-        // Laravel setup
-        $commands[] = 'php artisan key:generate --quiet';
-
-        if (config('directadmin-deploy.deployment.run_migrations', true)) {
-            $commands[] = "echo 'yes' | php artisan migrate --quiet";
-        }
-
-        if (config('directadmin-deploy.deployment.run_storage_link', true)) {
-            $commands[] = 'php artisan storage:link --quiet';
+        if ($this->driver()->shouldManagePublicHtmlSymlink() && $domainPath) {
+            $publicHtml = $this->driver()->publicHtmlName();
+            $laravelHtml = $this->driver()->laravelHtmlName();
+            $public = $this->driver()->publicDirName();
+            $commands[] = "cd {$domainPath}";
+            $commands[] = "ln -s {$laravelHtml}/{$public} {$publicHtml}";
+            $commands[] = "cd {$appPath}";
         }
 
         return $commands;
     }
 
-    /**
-     * Handle git authentication error by displaying public key and instructions.
-     */
-    protected function handleGitAuthenticationError(string $repoUrl, string $siteDir, string $cloneChoice): bool
+    protected function configureRemoteEnvironment(): void
+    {
+        $answers = $this->wizardAnswers ?: config('webhosting-deploy.runtime.wizard');
+
+        if (! is_array($answers) || $answers === []) {
+            return;
+        }
+
+        $this->wizardAnswers = $answers;
+
+        $this->info('📝 Writing remote .env application settings...');
+        $this->applyRemoteEnv((new DeployWizard)->remoteEnvValues($answers));
+
+        if (($answers['database']['connection'] ?? '') === 'sqlite') {
+            $sqlite = $answers['database']['database'] ?? 'database/database.sqlite';
+            $this->ssh->execute('cd '.$this->driver()->shellAppPath().' && mkdir -p "$(dirname '.escapeshellarg($sqlite).')" && touch '.escapeshellarg($sqlite));
+        }
+    }
+
+    protected function runRemoteArtisanSetup(): void
+    {
+        $appPath = $this->driver()->shellAppPath();
+        $commands = [
+            "cd {$appPath}",
+            'if ! grep -q "^APP_KEY=base64:" .env 2>/dev/null; then php artisan key:generate --force --quiet; fi',
+        ];
+
+        $runMigrations = (bool) config('webhosting-deploy.deployment.run_migrations', true);
+        if ($this->wizardAnswers !== null) {
+            $runMigrations = (bool) $this->wizardAnswers['run_migrations'];
+        }
+
+        if ($runMigrations) {
+            $commands[] = 'php artisan migrate --force --quiet';
+        } else {
+            $this->warn('⚠️  Skipping migrations (database not configured or skipped in the wizard).');
+        }
+
+        if (config('webhosting-deploy.deployment.run_storage_link', true)) {
+            $commands[] = 'php artisan storage:link --quiet --force';
+        }
+
+        $this->ssh->executeMultiple($commands);
+    }
+
+    protected function handleGitAuthenticationError(string $repoUrl, string $cloneChoice): bool
     {
         $this->line('');
         $this->warn('🔑 Git authentication failed! The deploy key is not set up correctly.');
         $this->line('');
 
-        // Get public key from server
         $publicKey = $this->ssh->getPublicKey();
 
         if (! $publicKey) {
@@ -404,228 +373,162 @@ class DeploySharedCommand extends BaseDirectAdminCommand
             }
         }
 
-        if ($publicKey) {
-            // Get repository information
-            $repoInfo = $this->github->parseRepositoryUrl($repoUrl);
-
-            // Check if deploy key already exists (via API if available)
-            $keyExists = false;
-            if ($this->githubAPI && $repoInfo) {
-                try {
-                    $keyExists = $this->githubAPI->keyExists($repoInfo['owner'], $repoInfo['name'], $publicKey);
-                    if ($keyExists) {
-                        $this->info('✅ Deploy key already exists in repository');
-                        // Retry deployment
-                        $this->info('🔄 Retrying deployment...');
-                        try {
-                            $commands = $this->buildDeploymentCommands($repoUrl, $siteDir, $cloneChoice);
-                            $this->ssh->executeMultiple($commands);
-
-                            return true;
-                        } catch (\Exception $e) {
-                            $this->warn('⚠️  Deployment still failed: '.$e->getMessage());
-                            // Continue to show the key below
-                        }
-                    }
-                } catch (\Exception $e) {
-                    // If check fails, proceed to show the key
-                }
-            }
-
-            // If key doesn't exist, try to add via API first
-            if (! $keyExists && $this->githubAPI && $repoInfo) {
-                try {
-                    $this->info('🔑 Attempting to add deploy key via API...');
-                    $this->githubAPI->createDeployKey($repoInfo['owner'], $repoInfo['name'], $publicKey, 'DirectAdmin Server', false);
-                    $this->info('✅ Deploy key added successfully via API');
-                    // Retry deployment
-                    $this->info('🔄 Retrying deployment...');
-                    try {
-                        $commands = $this->buildDeploymentCommands($repoUrl, $siteDir, $cloneChoice);
-                        $this->ssh->executeMultiple($commands);
-
-                        return true;
-                    } catch (\Exception $e) {
-                        $this->warn('⚠️  Deployment still failed: '.$e->getMessage());
-                        // Continue to show manual instructions below
-                    }
-                } catch (\Exception $e) {
-                    $this->warn('⚠️  Failed to add deploy key via API: '.$e->getMessage());
-                    $this->warn('   Falling back to manual method...');
-                    $this->line('');
-                }
-            }
-
-            // Only show deploy key if it doesn't exist and needs to be added manually
-            if (! $keyExists) {
-                $this->info('📋 Add this SSH public key to your GitHub repository:');
-                $this->line('');
-
-                if ($repoInfo) {
-                    $deployKeysUrl = $this->github->getDeployKeysUrl($repoInfo['owner'], $repoInfo['name']);
-                    $this->line("   Go to: {$deployKeysUrl}");
-                } else {
-                    $this->line('   Go to: Your repository → Settings → Deploy keys');
-                }
-
-                $this->line('');
-                $this->warn('   Steps:');
-                $this->line('   1. Click "Add deploy key"');
-                $this->line('   2. Give it a title (e.g., "DirectAdmin Server")');
-                $this->line('   3. Paste the public key below');
-                $this->line('   4. ✅ Check "Allow write access" (optional, for deployments)');
-                $this->line('   5. Click "Add key"');
-                $this->line('');
-                $this->line('   '.str_repeat('-', 60));
-                $this->line($publicKey);
-                $this->line('   '.str_repeat('-', 60));
-                $this->line('');
-
-                // Retry loop - keep asking until deployment succeeds or user gives up
-                $maxRetries = 3;
-                $attempt = 0;
-
-                while ($attempt < $maxRetries) {
-                    $this->ask('Press ENTER after you have added the deploy key to GitHub to continue...', '');
-                    $this->info('🔄 Retrying deployment...');
-
-                    try {
-                        $commands = $this->buildDeploymentCommands($repoUrl, $siteDir, $cloneChoice);
-                        $this->ssh->executeMultiple($commands);
-
-                        // Success - let main handle method display success message
-                        return true;
-                    } catch (\Exception $e) {
-                        $attempt++;
-
-                        // Check if it's still an authentication error
-                        if ($this->isGitAuthenticationError($e) && $attempt < $maxRetries) {
-                            $this->line('');
-                            $this->warn("⚠️  Authentication still failed (attempt {$attempt}/{$maxRetries})");
-                            $this->line('');
-                            $this->warn('💡 Please make sure:');
-                            $this->line('   1. You have copied the public key correctly');
-                            $this->line('   2. You have added it as a deploy key (not SSH key)');
-                            $this->line('   3. You have saved the deploy key');
-                            $this->line('');
-                            $this->info('📋 Here is your public key again:');
-                            $this->line('');
-                            $this->line('   '.str_repeat('-', 60));
-                            $this->line($publicKey);
-                            $this->line('   '.str_repeat('-', 60));
-                            $this->line('');
-
-                            continue;
-                        } else {
-                            // Not an auth error or max retries reached
-                            return $this->handleDeploymentFailure($e, $repoUrl, $attempt >= $maxRetries);
-                        }
-                    }
-                }
-
-                return false;
-            } else {
-                // Key already exists but deployment still failed - show error
-                return $this->handleDeploymentFailure(new \Exception('Deployment failed even though deploy key exists'), $repoUrl, false);
-            }
-        } else {
+        if (! $publicKey) {
             $this->error('❌ Could not retrieve or generate SSH public key.');
 
             return false;
         }
-    }
 
-    /**
-     * Handle deployment failure with user-friendly error messages.
-     */
-    protected function handleDeploymentFailure(\Exception $e, string $repoUrl, bool $maxRetriesReached): bool
-    {
+        $repoInfo = $this->github->parseRepositoryUrl($repoUrl);
+
+        $keyExists = false;
+        if ($this->githubAPI && $repoInfo) {
+            try {
+                $keyExists = $this->githubAPI->keyExists($repoInfo['owner'], $repoInfo['name'], $publicKey);
+                if ($keyExists) {
+                    $this->info('✅ Deploy key already exists in repository');
+                    $this->info('🔄 Retrying deployment...');
+                    try {
+                        $this->ssh->executeMultiple($this->buildDeploymentCommands($repoUrl, $cloneChoice));
+                        $this->configureRemoteEnvironment();
+                        $this->runRemoteArtisanSetup();
+
+                        return true;
+                    } catch (\Exception $e) {
+                        $this->warn('⚠️  Deployment still failed: '.$e->getMessage());
+                    }
+                }
+            } catch (\Exception $e) {
+                // continue
+            }
+        }
+
+        if (! $keyExists && $this->githubAPI && $repoInfo) {
+            try {
+                $this->info('🔑 Attempting to add deploy key via API...');
+                $this->githubAPI->createDeployKey($repoInfo['owner'], $repoInfo['name'], $publicKey, 'Webhosting Deploy', false);
+                $this->info('✅ Deploy key added successfully via API');
+                $this->info('🔄 Retrying deployment...');
+                try {
+                    $this->ssh->executeMultiple($this->buildDeploymentCommands($repoUrl, $cloneChoice));
+                    $this->configureRemoteEnvironment();
+                    $this->runRemoteArtisanSetup();
+
+                    return true;
+                } catch (\Exception $e) {
+                    $this->warn('⚠️  Deployment still failed: '.$e->getMessage());
+                }
+            } catch (\Exception $e) {
+                $this->warn('⚠️  Failed to add deploy key via API: '.$e->getMessage());
+                $this->warn('   Falling back to manual method...');
+                $this->line('');
+            }
+        }
+
+        if ($keyExists) {
+            return $this->handleDeploymentFailure(new \Exception('Deployment failed even though deploy key exists'), $repoUrl, false);
+        }
+
+        $this->info('📋 Add this SSH public key to your GitHub repository:');
         $this->line('');
 
-        $showErrors = $this->option('show-errors');
-        $errorMessage = $e->getMessage();
-
-        if ($maxRetriesReached) {
-            $this->error('❌ Maximum retry attempts reached.');
-            $this->line('');
-
-            // Show actual error details if show-errors flag is set or if error contains useful info
-            if ($showErrors || strpos($errorMessage, 'Error output:') !== false || strpos($errorMessage, 'exit code:') !== false) {
-                $this->warn('📋 Error Details:');
-                $this->line('');
-                $errorLines = explode("\n", $errorMessage);
-                foreach ($errorLines as $line) {
-                    if (strpos($line, 'exit code:') !== false || strpos($line, 'Error output:') !== false) {
-                        $this->line('   ⚠️  '.$line);
-                    } else {
-                        $this->line('   '.$line);
-                    }
-                }
-                $this->line('');
-            }
-
-            $this->warn('💡 Please check:');
-            $this->line('   1. The deploy key has been added correctly to GitHub');
-            $this->line('   2. The repository URL is correct: '.$repoUrl);
-            $this->line('   3. You have access to the repository');
-            $this->line('   4. The deploy key has write access (if needed)');
-            $this->line('');
-
-            if (! $showErrors) {
-                $this->info('💡 Tip: Run with --show-errors flag to see detailed error messages.');
-                $this->line('');
-            }
-
-            $this->info('🔧 You can try running the command again after fixing the issue.');
+        if ($repoInfo) {
+            $this->line('   Go to: '.$this->github->getDeployKeysUrl($repoInfo['owner'], $repoInfo['name']));
         } else {
-            // Not an authentication error - show general deployment failure
-            $this->error('❌ Deployment failed.');
-            $this->line('');
+            $this->line('   Go to: Your repository → Settings → Deploy keys');
+        }
 
-            // Show actual error details if show-errors flag is set or if error contains useful info
-            if ($showErrors || strpos($errorMessage, 'Error output:') !== false || strpos($errorMessage, 'exit code:') !== false) {
-                $this->warn('📋 Error Details:');
-                $this->line('');
-                $errorLines = explode("\n", $errorMessage);
-                foreach ($errorLines as $line) {
-                    if (strpos($line, 'exit code:') !== false || strpos($line, 'Error output:') !== false) {
-                        $this->line('   ⚠️  '.$line);
-                    } else {
-                        $this->line('   '.$line);
-                    }
+        $this->line('');
+        $this->warn('   Steps:');
+        $this->line('   1. Click "Add deploy key"');
+        $this->line('   2. Give it a title (e.g., "Webhosting Deploy")');
+        $this->line('   3. Paste the public key below');
+        $this->line('   4. ✅ Check "Allow write access" (optional, for deployments)');
+        $this->line('   5. Click "Add key"');
+        $this->line('');
+        $this->line('   '.str_repeat('-', 60));
+        $this->line($publicKey);
+        $this->line('   '.str_repeat('-', 60));
+        $this->line('');
+
+        $maxRetries = 3;
+        $attempt = 0;
+
+        while ($attempt < $maxRetries) {
+            $this->ask('Press ENTER after you have added the deploy key to GitHub to continue...', '');
+            $this->info('🔄 Retrying deployment...');
+
+            try {
+                $this->ssh->executeMultiple($this->buildDeploymentCommands($repoUrl, $cloneChoice));
+                $this->configureRemoteEnvironment();
+                $this->runRemoteArtisanSetup();
+
+                return true;
+            } catch (\Exception $e) {
+                $attempt++;
+
+                if ($this->isGitAuthenticationError($e) && $attempt < $maxRetries) {
+                    $this->line('');
+                    $this->warn("⚠️  Authentication still failed (attempt {$attempt}/{$maxRetries})");
+                    $this->line('');
+                    continue;
                 }
-                $this->line('');
+
+                return $this->handleDeploymentFailure($e, $repoUrl, $attempt >= $maxRetries);
             }
-
-            $this->warn('💡 This might be due to:');
-            $this->line('   1. Server connection issues');
-            $this->line('   2. Repository access problems');
-            $this->line('   3. Missing dependencies on the server');
-            $this->line('   4. Command execution failures (composer, git, etc.)');
-            $this->line('');
-
-            if (! $showErrors) {
-                $this->info('💡 Tip: Run with --show-errors flag to see detailed error messages.');
-                $this->line('');
-            }
-
-            $this->info('🔧 Please check your server configuration and try again.');
         }
 
         return false;
     }
 
-    /**
-     * Extract Git hostname from repository URL.
-     */
+    protected function handleDeploymentFailure(\Exception $e, string $repoUrl, bool $maxRetriesReached): bool
+    {
+        $this->line('');
+
+        if ($maxRetriesReached) {
+            $this->error('❌ Maximum retry attempts reached.');
+            $this->line('');
+            $this->displayExceptionDetails($e);
+            $this->warn('💡 Please check:');
+            $this->line('   1. The deploy key has been added correctly to GitHub');
+            $this->line('   2. The repository URL is correct: '.$repoUrl);
+            $this->line('   3. You have access to the repository');
+            $this->line('');
+        } else {
+            $this->error('❌ Deployment failed.');
+            $this->line('');
+            $this->displayExceptionDetails($e);
+        }
+
+        if (! $this->option('show-errors')) {
+            $this->info('💡 Tip: Run with --show-errors flag to see detailed error messages.');
+            $this->line('');
+        }
+
+        return false;
+    }
+
+    protected function displayExceptionDetails(\Exception $e): void
+    {
+        $showErrors = (bool) $this->option('show-errors');
+        $errorMessage = $e->getMessage();
+
+        if ($showErrors || strpos($errorMessage, 'Error output:') !== false || strpos($errorMessage, 'exit code:') !== false) {
+            $this->warn('📋 Error Details:');
+            $this->line('');
+            foreach (explode("\n", $errorMessage) as $line) {
+                $this->line('   '.$line);
+            }
+            $this->line('');
+        }
+    }
+
     protected function extractGitHost(string $repoUrl): ?string
     {
-        // Handle SSH URLs: git@github.com:owner/repo.git or git@gitlab.com:owner/repo.git
         if (preg_match('/git@([^:]+):/', $repoUrl, $matches)) {
             return $matches[1];
         }
 
-        // Handle HTTPS URLs: https://github.com/owner/repo.git or https://gitlab.com/owner/repo.git
         if (preg_match('/https?:\/\/([^\/]+)/', $repoUrl, $matches)) {
             return $matches[1];
         }
@@ -633,9 +536,6 @@ class DeploySharedCommand extends BaseDirectAdminCommand
         return null;
     }
 
-    /**
-     * Build frontend assets if package.json exists.
-     */
     protected function buildFrontendAssets(): void
     {
         $packageJsonPath = base_path('package.json');
@@ -647,18 +547,16 @@ class DeploySharedCommand extends BaseDirectAdminCommand
         $this->info('📦 Found package.json - building frontend assets...');
 
         try {
-            // Check if npm is available
-            $npmCheck = \Illuminate\Support\Facades\Process::run('which npm');
+            $npmCheck = Process::run('which npm');
             if (! $npmCheck->successful()) {
                 $this->warn('⚠️  npm not found. Skipping asset build.');
 
                 return;
             }
 
-            // Install dependencies if node_modules doesn't exist
             if (! is_dir(base_path('node_modules'))) {
                 $this->info('📥 Installing npm dependencies...');
-                $installProcess = \Illuminate\Support\Facades\Process::path(base_path())
+                $installProcess = Process::path(base_path())
                     ->timeout(300)
                     ->run('npm install');
 
@@ -669,9 +567,8 @@ class DeploySharedCommand extends BaseDirectAdminCommand
                 }
             }
 
-            // Run build command
             $this->info('🔨 Running npm run build...');
-            $buildProcess = \Illuminate\Support\Facades\Process::path(base_path())
+            $buildProcess = Process::path(base_path())
                 ->timeout(300)
                 ->run('npm run build');
 
@@ -689,9 +586,6 @@ class DeploySharedCommand extends BaseDirectAdminCommand
         }
     }
 
-    /**
-     * Copy built assets to remote server.
-     */
     protected function copyBuiltAssetsToServer(): void
     {
         $buildPath = base_path('public/build');
@@ -703,26 +597,21 @@ class DeploySharedCommand extends BaseDirectAdminCommand
         $this->info('📤 Copying built assets to server...');
 
         try {
-            $siteDir = $this->getSiteDir();
-            $absolutePath = $this->getAbsoluteSitePath($siteDir);
-            $remoteBuildPath = "{$absolutePath}/public/build";
+            $remoteBuildPath = $this->driver()->rsyncAppPath().'/public/build';
+            $host = config('webhosting-deploy.ssh.host');
+            $username = config('webhosting-deploy.ssh.username');
+            $port = config('webhosting-deploy.ssh.port', 22);
 
-            // Build rsync command
-            $host = config('directadmin-deploy.ssh.host');
-            $username = config('directadmin-deploy.ssh.username');
-            $port = config('directadmin-deploy.ssh.port', 22);
-
-            // Use rsync to copy files
             $rsyncCommand = sprintf(
                 'rsync -r -e "ssh -p %d -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" %s/ %s@%s:%s',
                 $port,
                 escapeshellarg($buildPath),
                 $username,
                 $host,
-                escapeshellarg($remoteBuildPath)
+                $remoteBuildPath
             );
 
-            $rsyncProcess = \Illuminate\Support\Facades\Process::timeout(60)->run($rsyncCommand);
+            $rsyncProcess = Process::timeout(60)->run($rsyncCommand);
 
             if (! $rsyncProcess->successful()) {
                 $this->warn('⚠️  Failed to copy built assets: '.$rsyncProcess->errorOutput());

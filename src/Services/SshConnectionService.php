@@ -1,6 +1,6 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Services;
+namespace CocomediaNL\LaravelWebhostingDeploy\Services;
 
 use Illuminate\Support\Facades\Process;
 
@@ -124,6 +124,7 @@ class SshConnectionService
     public function generateSshKey(): bool
     {
         try {
+            $this->prepareSshDirectory();
             $this->execute('ssh-keygen -t rsa -b 4096 -C "github-deploy-key" -N "" -f ~/.ssh/id_rsa');
 
             return true;
@@ -133,23 +134,29 @@ class SshConnectionService
     }
 
     /**
+     * Ensure ~/.ssh exists with permissions OpenSSH accepts.
+     */
+    public function prepareSshDirectory(): void
+    {
+        $this->execute('mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys');
+    }
+
+    /**
      * Add a public key to authorized_keys if it doesn't already exist.
      */
     public function addToAuthorizedKeys(string $publicKey): bool
     {
         try {
-            // Check if the key already exists in authorized_keys
-            $keyExists = $this->keyExistsInAuthorizedKeys($publicKey);
+            $this->prepareSshDirectory();
 
-            if ($keyExists) {
-                // Key already exists, don't add it again
+            if ($this->keyExistsInAuthorizedKeys($publicKey)) {
                 return true;
             }
 
-            // Key doesn't exist, add it
-            $this->execute("echo '{$publicKey}' >> ~/.ssh/authorized_keys");
+            $encoded = base64_encode(trim($publicKey)."\n");
+            $this->execute("echo {$encoded} | base64 -d >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys");
 
-            return true;
+            return $this->keyExistsInAuthorizedKeys($publicKey);
         } catch (\Exception $e) {
             return false;
         }
@@ -197,6 +204,46 @@ class SshConnectionService
     }
 
     /**
+     * Check whether the server's own key is accepted for inbound SSH
+     * (the same login GitHub Actions uses via the SSH_KEY secret).
+     */
+    public function verifyLoginWithServerKey(): bool
+    {
+        $privateKey = $this->getPrivateKey();
+
+        if (! $privateKey) {
+            return false;
+        }
+
+        $tmp = tempnam(sys_get_temp_dir(), 'webhosting-ssh-');
+
+        if ($tmp === false) {
+            return false;
+        }
+
+        try {
+            file_put_contents($tmp, $privateKey."\n");
+            chmod($tmp, 0600);
+
+            $command = sprintf(
+                'ssh -p %d -i %s -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s@%s echo ok',
+                $this->port,
+                escapeshellarg($tmp),
+                $this->username,
+                $this->host
+            );
+
+            $result = Process::timeout($this->timeout)->run($command);
+
+            return $result->successful() && str_contains($result->output(), 'ok');
+        } catch (\Exception $e) {
+            return false;
+        } finally {
+            @unlink($tmp);
+        }
+    }
+
+    /**
      * Build the SSH command string.
      * Uses bash -c with proper escaping for reliable command execution.
      */
@@ -209,12 +256,17 @@ class SshConnectionService
             '-o UserKnownHostsFile=/dev/null',
         ];
 
-        // Use proper escaping for SSH command execution
-        // Escape the command properly for the shell
-        $escapedCommand = escapeshellarg($command);
-        $sshCommand = 'ssh '.implode(' ', $sshOptions).' '.$this->username.'@'.$this->host.' '.$escapedCommand;
+        $escapedCommand = escapeshellarg(self::withRemotePath($command));
 
-        return $sshCommand;
+        return 'ssh '.implode(' ', $sshOptions).' '.$this->username.'@'.$this->host.' '.$escapedCommand;
+    }
+
+    /**
+     * Prefix a remote command with a PATH that restricted SSH jails often omit.
+     */
+    public static function withRemotePath(string $command): string
+    {
+        return 'export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"; '.$command;
     }
 
     /**
@@ -278,5 +330,33 @@ class SshConnectionService
     public function getConnectionString(): string
     {
         return "ssh -p {$this->port} {$this->username}@{$this->host}";
+    }
+
+    public function setTimeout(int $timeout): static
+    {
+        $this->timeout = $timeout;
+
+        return $this;
+    }
+
+    /**
+     * Upload a local file to the remote server via scp.
+     */
+    public function uploadFile(string $localPath, string $remotePath): void
+    {
+        $command = sprintf(
+            'scp -P %d -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s %s@%s:%s',
+            $this->port,
+            escapeshellarg($localPath),
+            $this->username,
+            $this->host,
+            escapeshellarg($remotePath)
+        );
+
+        $result = Process::timeout($this->timeout)->run($command);
+
+        if (! $result->successful()) {
+            throw new \Exception('SCP upload failed: '.trim($result->errorOutput() ?: $result->output()));
+        }
     }
 }

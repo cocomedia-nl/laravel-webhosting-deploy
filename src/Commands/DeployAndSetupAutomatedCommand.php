@@ -1,61 +1,54 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Commands;
+namespace CocomediaNL\LaravelWebhostingDeploy\Commands;
 
-class DeployAndSetupAutomatedCommand extends BaseDirectAdminCommand
+class DeployAndSetupAutomatedCommand extends BaseWebhostingCommand
 {
-    /**
-     * The name and signature of the console command.
-     */
-    protected $signature = 'directadmin:deploy-and-setup-cicd 
+    protected $signature = 'webhosting:deploy-and-setup-cicd
                             {--fresh : Delete and clone fresh repository}
                             {--site-dir= : Override site directory from config}
                             {--token= : GitHub Personal Access Token}
                             {--branch= : Override default branch}
-                            {--php-version= : Override PHP version}';
+                            {--php-version= : Override PHP version}
+                            {--reconfigure : Re-run the deploy setup wizard}';
 
-    /**
-     * The console command description.
-     */
-    protected $description = 'Deploy Laravel application to DirectAdmin and setup automated deployment via GitHub API';
+    protected $description = 'Deploy Laravel application to shared webhosting and setup automated deployment via GitHub API';
 
-    /**
-     * Execute the console command.
-     */
+    protected $aliases = ['directadmin:deploy-and-setup-cicd'];
+
     public function handle(): int
     {
         $this->info('🚀 Starting complete deployment and automated setup...');
         $this->line('');
 
-        // Get or prompt for GitHub Personal Access Token if needed for Step 2
+        $this->runWizard(true);
+
         $token = $this->option('token') ?: env('GITHUB_API_TOKEN');
 
-        // Step 1: Deploy to server
         $this->info('═══════════════════════════════════════════════════════');
-        $this->info('Step 1: Deploying to DirectAdmin Server');
+        $this->info('Step 1: Deploying to webhosting server');
         $this->info('═══════════════════════════════════════════════════════');
         $this->line('');
 
-        $deployOptions = [];
+        $deployOptions = [
+            '--skip-wizard' => true,
+            '-v' => true,
+        ];
+
         if ($this->option('fresh')) {
             $deployOptions['--fresh'] = true;
         }
         if ($this->option('site-dir')) {
             $deployOptions['--site-dir'] = $this->option('site-dir');
         }
-
-        // Pass token to deploy command if available
+        if ($this->option('reconfigure')) {
+            $deployOptions['--reconfigure'] = true;
+        }
         if ($token) {
             $deployOptions['--token'] = $token;
         }
 
-        // Call the deploy command - output will be shown in real-time
-        // Pass through verbosity level to ensure all output is shown
-        $deployOptions['-v'] = true;
-        $deployExitCode = $this->call('directadmin:deploy', $deployOptions);
-
-        // If token was provided interactively in deploy command, capture it
-        // (Note: This won't work if entered interactively in sub-command, so we'll prompt before Step 2 instead)
+        $deployExitCode = $this->call('webhosting:deploy', $deployOptions);
 
         if ($deployExitCode !== self::SUCCESS) {
             $this->line('');
@@ -65,15 +58,12 @@ class DeployAndSetupAutomatedCommand extends BaseDirectAdminCommand
         }
 
         $this->line('');
-
-        // Step 2: Setup automated deployment
         $this->info('═══════════════════════════════════════════════════════');
         $this->info('Step 2: Setting up Automated Deployment');
         $this->info('═══════════════════════════════════════════════════════');
         $this->line('');
 
-        // Pass token to setup command if available (let setup-cicd handle the prompt if missing)
-        $setupOptions = [];
+        $setupOptions = ['-v' => true];
         if ($token) {
             $setupOptions['--token'] = $token;
         }
@@ -84,10 +74,7 @@ class DeployAndSetupAutomatedCommand extends BaseDirectAdminCommand
             $setupOptions['--php-version'] = $this->option('php-version');
         }
 
-        // Call the setup command - output will be shown in real-time
-        // Pass through verbosity level to ensure all output is shown
-        $setupOptions['-v'] = true;
-        $setupExitCode = $this->call('directadmin:setup-cicd', $setupOptions);
+        $setupExitCode = $this->call('webhosting:setup-cicd', $setupOptions);
 
         if ($setupExitCode !== self::SUCCESS) {
             $this->line('');
@@ -96,6 +83,7 @@ class DeployAndSetupAutomatedCommand extends BaseDirectAdminCommand
             return self::FAILURE;
         }
 
+        $workflowFile = config('webhosting-deploy.github.workflow_file', '.github/workflows/webhosting-deploy.yml');
         $siteDir = $this->getSiteDir();
 
         $this->line('');
@@ -103,13 +91,23 @@ class DeployAndSetupAutomatedCommand extends BaseDirectAdminCommand
         $this->info('🎉 Complete Setup Finished Successfully!');
         $this->info('═══════════════════════════════════════════════════════');
         $this->line('');
-        $this->info("🌐 Your Laravel application: https://{$siteDir}");
-        $this->line('');
+
+        if ($siteDir !== '') {
+            $this->info("🌐 Your Laravel application: https://{$siteDir}");
+            $this->line('');
+        }
+
+        $hint = $this->driver()->documentRootHint();
+        if ($hint) {
+            $this->info("ℹ️  Confirm the TransIP DocumentRoot is set to {$hint}");
+            $this->line('');
+        }
+
         $this->info('🚀 Next steps:');
-        $this->line('   1. Review the workflow file at .github/workflows/directadmin-deploy.yml');
+        $this->line("   1. Review the workflow file at {$workflowFile}");
         $this->line('   2. Commit and push the workflow file:');
-        $this->line('      git add .github/workflows/directadmin-deploy.yml');
-        $this->line('      git commit -m "Add DirectAdmin deployment workflow"');
+        $this->line("      git add {$workflowFile}");
+        $this->line('      git commit -m "Add webhosting deployment workflow"');
         $this->line('      git push');
         $this->line('   3. Monitor deployments in the Actions tab on GitHub');
         $this->line('   4. Your application will automatically deploy on push');

@@ -1,4 +1,4 @@
-name: DirectAdmin Deploy
+name: Webhosting Deploy
 
 on:
     push:
@@ -143,7 +143,7 @@ jobs:
                   retention-days: 1
 
     deploy:
-        name: Deploy to DirectAdmin
+        name: Deploy
         runs-on: ubuntu-latest
         needs: [tests, build-assets]
         if: success() || failure() # Deploy even if tests fail (you can change to 'success()' to require passing tests)
@@ -205,12 +205,12 @@ jobs:
               continue-on-error: true
               run: |
                   if [ -d "${{ github.workspace }}/public/build" ]; then
-                    rsync -r -e "ssh -p ${{ secrets.SSH_PORT }}" ${{ github.workspace }}/public/build/ ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:~/domains/${{ secrets.WEBSITE_FOLDER }}/laravel_html/public/build
+                    rsync -r -e "ssh -p ${{ secrets.SSH_PORT }}" ${{ github.workspace }}/public/build/ ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:~/${{ secrets.APP_PATH }}/public/build
                   else
                     echo "ℹ️ No build directory found, skipping asset copy"
                   fi
 
-            - name: Deploy to DirectAdmin Server
+            - name: Deploy to Server
               uses: appleboy/ssh-action@master
               with:
                   host: ${{ secrets.SSH_HOST }}
@@ -219,10 +219,11 @@ jobs:
                   key: ${{ secrets.SSH_KEY }}
                   script: |
                       set -e
+                      export PATH="$HOME/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
                       echo "🚀 Starting deployment..."
 
-                      cd domains/${{ secrets.WEBSITE_FOLDER }}/laravel_html
+                      cd ${{ secrets.APP_PATH }}
 
                       # Ensure we're on the correct branch
                       git fetch origin
@@ -243,6 +244,8 @@ jobs:
 
                       # Run migrations
                       php artisan migrate --force
+
+                      php artisan storage:link --force || true
 
                       # Clear and cache configuration
                       php artisan config:clear

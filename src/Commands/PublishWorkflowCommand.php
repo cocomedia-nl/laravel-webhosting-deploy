@@ -1,29 +1,23 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Commands;
+namespace CocomediaNL\LaravelWebhostingDeploy\Commands;
 
 use Illuminate\Support\Facades\File;
 
-class PublishWorkflowCommand extends BaseDirectAdminCommand
+use function Laravel\Prompts\select;
+
+class PublishWorkflowCommand extends BaseWebhostingCommand
 {
-    /**
-     * The name and signature of the console command.
-     */
-    protected $signature = 'directadmin:publish-workflow 
+    protected $signature = 'webhosting:publish-workflow
                             {--branch= : Override default branch}
                             {--php-version= : Override PHP version}';
 
-    /**
-     * The console command description.
-     */
     protected $description = 'Publish GitHub Actions workflow file for automated deployment';
 
-    /**
-     * Execute the console command.
-     */
+    protected $aliases = ['directadmin:publish-workflow'];
+
     public function handle(): int
     {
-        // Check if we're in a Git repository
         $repoInfo = $this->getRepositoryInfo();
         if (! $repoInfo) {
             $this->error('❌ Not in a Git repository or could not detect repository information. Please run this command from a Git repository.');
@@ -31,17 +25,15 @@ class PublishWorkflowCommand extends BaseDirectAdminCommand
             return self::FAILURE;
         }
 
-        // Get configuration
-        $branch = $this->option('branch') ?: $this->github->getCurrentBranch() ?: config('directadmin-deploy.github.default_branch', 'main');
-        $phpVersion = $this->option('php-version') ?: config('directadmin-deploy.github.php_version', '8.3');
-        $workflowFile = config('directadmin-deploy.github.workflow_file', '.github/workflows/directadmin-deploy.yml');
+        $branch = $this->option('branch') ?: $this->github->getCurrentBranch() ?: config('webhosting-deploy.github.default_branch', 'main');
+        $phpVersion = $this->option('php-version') ?: config('webhosting-deploy.github.php_version', '8.3');
+        $workflowFile = config('webhosting-deploy.github.workflow_file', '.github/workflows/webhosting-deploy.yml');
 
-        // Check if file already exists
         if (File::exists($workflowFile)) {
-            $choice = $this->choice(
-                "Workflow file already exists at {$workflowFile}. What would you like to do?",
-                ['Overwrite', 'Skip'],
-                0
+            $choice = select(
+                label: "Workflow file already exists at {$workflowFile}. What would you like to do?",
+                options: ['Overwrite', 'Skip'],
+                default: 'Overwrite'
             );
 
             if ($choice === 'Skip') {
@@ -51,16 +43,13 @@ class PublishWorkflowCommand extends BaseDirectAdminCommand
             }
         }
 
-        // Create .github/workflows directory if it doesn't exist
         $workflowDir = dirname($workflowFile);
         if (! File::exists($workflowDir)) {
             File::makeDirectory($workflowDir, 0755, true);
         }
 
-        // Generate workflow content
         $workflowContent = $this->generateWorkflowContent($branch, $phpVersion);
 
-        // Write workflow file
         if (File::put($workflowFile, $workflowContent)) {
             $this->info("✅ Workflow file published: {$workflowFile}");
         } else {

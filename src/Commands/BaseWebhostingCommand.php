@@ -1,14 +1,21 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Commands;
+namespace CocomediaNL\LaravelWebhostingDeploy\Commands;
 
-use CocomediaNL\LaravelDirectAdminDeploy\Services\GitHubActionsService;
-use CocomediaNL\LaravelDirectAdminDeploy\Services\GitHubAPIService;
-use CocomediaNL\LaravelDirectAdminDeploy\Services\SshConnectionService;
+use CocomediaNL\LaravelWebhostingDeploy\Drivers\DriverManager;
+use CocomediaNL\LaravelWebhostingDeploy\Drivers\HostingDriver;
+use CocomediaNL\LaravelWebhostingDeploy\Services\GitHubActionsService;
+use CocomediaNL\LaravelWebhostingDeploy\Services\GitHubAPIService;
+use CocomediaNL\LaravelWebhostingDeploy\Services\SshConnectionService;
+use CocomediaNL\LaravelWebhostingDeploy\Support\DeployWizard;
+use CocomediaNL\LaravelWebhostingDeploy\Support\EnvFile;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
 
-abstract class BaseDirectAdminCommand extends Command
+use function Laravel\Prompts\confirm;
+use function Laravel\Prompts\pause;
+
+abstract class BaseWebhostingCommand extends Command
 {
     protected SshConnectionService $ssh;
 
@@ -16,38 +23,69 @@ abstract class BaseDirectAdminCommand extends Command
 
     protected ?GitHubAPIService $githubAPI = null;
 
+    /**
+     * @var array<string, mixed>|null
+     */
+    protected ?array $wizardAnswers = null;
+
     public function __construct()
     {
         parent::__construct();
         $this->github = new GitHubActionsService;
     }
 
+    protected function driver(): HostingDriver
+    {
+        return DriverManager::make();
+    }
+
     /**
-     * Validate required configuration.
+     * Validate required configuration after the wizard (if any) has run.
      */
     protected function validateConfiguration(): bool
     {
-        $required = [
-            'DIRECTADMIN_SSH_HOST' => config('directadmin-deploy.ssh.host'),
-            'DIRECTADMIN_SSH_USERNAME' => config('directadmin-deploy.ssh.username'),
-            'DIRECTADMIN_SITE_DIR' => $this->getSiteDir(),
-        ];
+        $host = config('webhosting-deploy.ssh.host');
+        $username = config('webhosting-deploy.ssh.username');
 
-        foreach ($required as $key => $value) {
-            if (empty($value)) {
-                $this->error("❌ Missing required environment variable: {$key}");
-                $this->info("Please add {$key} to your .env file");
+        if (empty($host) || empty($username)) {
+            $this->error('Missing SSH host or username. Run php artisan webhosting:deploy-and-setup-cicd to configure the target server.');
 
-                return false;
-            }
+            return false;
+        }
+
+        $driver = $this->driver();
+
+        if ($driver->requiresSiteDir() && empty($this->getSiteDir())) {
+            $this->error('Missing required website folder for DirectAdmin. Set WEBHOSTING_SITE_DIR (or DIRECTADMIN_SITE_DIR) or run the setup wizard.');
+
+            return false;
         }
 
         return true;
     }
 
     /**
-     * Get repository information.
+     * @return array<string, mixed>
      */
+    protected function runWizard(bool $force = false): array
+    {
+        $missing = empty(config('webhosting-deploy.ssh.host')) || empty(config('webhosting-deploy.ssh.username'));
+        $needsSiteDir = $this->driver()->requiresSiteDir() && empty($this->getSiteDir());
+
+        if (! $force && ! $missing && ! $needsSiteDir) {
+            return $this->wizardAnswers ?? [];
+        }
+
+        $wizard = new DeployWizard;
+        $this->wizardAnswers = $wizard->run();
+        $wizard->applyToConfig($this->wizardAnswers);
+        $wizard->writeLocalEnv($this->wizardAnswers);
+
+        $this->info('Saved deploy settings to your local .env');
+
+        return $this->wizardAnswers;
+    }
+
     protected function getRepositoryInfo(): ?array
     {
         if (! $this->github->isGitRepository()) {
@@ -57,9 +95,6 @@ abstract class BaseDirectAdminCommand extends Command
         return $this->github->getRepositoryInfo();
     }
 
-    /**
-     * Get repository URL from Git.
-     */
     protected function getRepositoryUrl(): ?string
     {
         $repoUrl = $this->github->getRepositoryUrl();
@@ -73,77 +108,51 @@ abstract class BaseDirectAdminCommand extends Command
         return $repoUrl;
     }
 
-    /**
-     * Setup SSH connection service.
-     */
     protected function setupSshConnection(): void
     {
         $this->ssh = new SshConnectionService(
-            config('directadmin-deploy.ssh.host'),
-            config('directadmin-deploy.ssh.username'),
-            config('directadmin-deploy.ssh.port', 22),
-            config('directadmin-deploy.ssh.timeout', 30)
+            (string) config('webhosting-deploy.ssh.host'),
+            (string) config('webhosting-deploy.ssh.username'),
+            (int) config('webhosting-deploy.ssh.port', 22),
+            (int) config('webhosting-deploy.ssh.timeout', 30)
         );
     }
 
-    /**
-     * Initialize GitHub API service (optional).
-     */
     protected function initializeGitHubAPI(?string $repoUrl = null, bool $required = false): bool
     {
         try {
-            $token = $this->option('token') ?: env('GITHUB_API_TOKEN');
+            $token = ($this->hasOption('token') ? $this->option('token') : null) ?: env('GITHUB_API_TOKEN');
 
             if (! $token) {
-                if ($required) {
-                    $this->line('');
-                    $this->warn('⚠️  GitHub Personal Access Token is not set.');
-                    $this->line('');
-
-                    if (! $this->confirm('Do you want to proceed?', true)) {
-                        // User chose "no" - show instructions and exit
-                        $this->line('');
-                        $this->warn('💡 How to provide your GitHub Personal Access Token:');
-                        $this->line('   Option 1: Set GITHUB_API_TOKEN in your .env file');
-                        $this->line('   Option 2: Use --token=YOUR_TOKEN option when running this command');
-                        $this->line('');
-                        $this->showGitHubTokenInstructions();
-                        $this->line('');
-                        $this->info('📝 Please add GITHUB_API_TOKEN to your .env file and rerun the script.');
-                        $this->line('');
-
-                        return false;
-                    }
-
-                    // User chose "yes" - continue without token, secrets will be displayed manually
-                    $this->warn('⚠️  Continuing without Personal Access Token. Secrets will be displayed for manual setup.');
-
-                    return true;
-                }
-
                 $this->line('');
                 $this->warn('⚠️  GitHub Personal Access Token is not set.');
                 $this->line('');
 
-                if (! $this->confirm('Do you want to proceed?', true)) {
-                    // User chose "no" - show instructions and halt
+                if (! confirm('Do you want to proceed without a token?', true)) {
+                    $this->line('');
+                    $this->warn('💡 How to provide your GitHub Personal Access Token:');
+                    $this->line('   Option 1: Set GITHUB_API_TOKEN in your .env file');
+                    $this->line('   Option 2: Use --token=YOUR_TOKEN option when running this command');
                     $this->line('');
                     $this->showGitHubTokenInstructions();
                     $this->line('');
                     $this->info('📝 Please add GITHUB_API_TOKEN to your .env file and rerun the script.');
                     $this->line('');
-                    exit(0);
+
+                    return false;
                 }
 
-                // User chose "yes" - continue without token, deploy key will be shown manually
-                $this->warn('⚠️  Continuing without Personal Access Token. Deploy key will be displayed for manual addition.');
+                if ($required) {
+                    $this->warn('⚠️  Continuing without Personal Access Token. Secrets will be displayed for manual setup.');
+                } else {
+                    $this->warn('⚠️  Continuing without Personal Access Token. Deploy key will be displayed for manual addition.');
+                }
 
                 return true;
             }
 
             $this->githubAPI = new GitHubAPIService($token);
 
-            // Test API connection
             if (! $this->githubAPI->testConnection()) {
                 if ($required) {
                     $this->error('❌ Failed to authenticate with GitHub API. Please check your token.');
@@ -169,7 +178,6 @@ abstract class BaseDirectAdminCommand extends Command
                 return false;
             }
 
-            // API is optional, continue without it
             $this->warn('⚠️  GitHub API initialization failed: '.$e->getMessage());
             $this->warn('   Deploy key will need to be added manually.');
             $this->githubAPI = null;
@@ -178,16 +186,13 @@ abstract class BaseDirectAdminCommand extends Command
         }
     }
 
-    /**
-     * Show instructions for generating GitHub Personal Access Token.
-     */
     protected function showGitHubTokenInstructions(): void
     {
         $this->info('🔑 To create a GitHub Personal Access Token:');
         $this->line('');
         $this->line('   1. Go to: https://github.com/settings/personal-access-tokens');
         $this->line('   2. Click "Generate new token" → "Generate new token (classic)"');
-        $this->line('   3. Give your token a descriptive name (e.g., "DirectAdmin Deploy")');
+        $this->line('   3. Give your token a descriptive name (e.g., "Webhosting Deploy")');
         $this->line('   4. Set expiration (or no expiration)');
         $this->line('   5. Select the following permissions:');
         $this->line('');
@@ -205,12 +210,11 @@ abstract class BaseDirectAdminCommand extends Command
         $this->info('💡 Tip: You can also set GITHUB_API_TOKEN in your .env file to skip this prompt.');
     }
 
-    /**
-     * Setup SSH keys on server if needed.
-     */
     protected function setupSshKeys(bool $addToAuthorizedKeys = true): bool
     {
         try {
+            $this->ssh->prepareSshDirectory();
+
             if (! $this->ssh->sshKeyExists()) {
                 $this->info('🔑 Generating SSH keys on server...');
                 if (! $this->ssh->generateSshKey()) {
@@ -222,7 +226,6 @@ abstract class BaseDirectAdminCommand extends Command
                 $this->info('🔑 SSH keys already exist on server');
             }
 
-            // Get public key
             $publicKey = $this->ssh->getPublicKey();
 
             if (! $publicKey) {
@@ -231,11 +234,12 @@ abstract class BaseDirectAdminCommand extends Command
                 return false;
             }
 
-            // Add to authorized_keys if requested
             if ($addToAuthorizedKeys) {
                 if (! $this->ssh->addToAuthorizedKeys($publicKey)) {
                     $this->warn('⚠️  Could not add public key to authorized_keys (may already exist)');
                 }
+
+                $this->verifyInboundServerKey($publicKey);
             }
 
             $this->info('✅ SSH keys setup completed');
@@ -249,8 +253,51 @@ abstract class BaseDirectAdminCommand extends Command
     }
 
     /**
-     * Add deploy key to GitHub repository via API.
+     * GitHub Actions logs in with the server private key. DirectAdmin often ignores
+     * a raw authorized_keys write until the same key is authorized in the panel.
      */
+    protected function verifyInboundServerKey(?string $publicKey = null): bool
+    {
+        if ($this->ssh->verifyLoginWithServerKey()) {
+            $this->info('✅ Server key is accepted for SSH login (GitHub Actions can connect)');
+
+            return true;
+        }
+
+        $this->warn('⚠️  The server key is not accepted for SSH login yet.');
+        $this->line('GitHub Actions uses this key (secret SSH_KEY) to connect. Outbound git fetch can still work.');
+        $this->explainInboundKeyAuthorization($publicKey ?: $this->ssh->getPublicKey());
+
+        return false;
+    }
+
+    protected function explainInboundKeyAuthorization(?string $publicKey): void
+    {
+        $this->line('');
+
+        if ($this->driver()->name() === 'directadmin') {
+            $this->warn('DirectAdmin limitation: sshd often ignores ~/.ssh/authorized_keys until the key is authorized in the panel.');
+            $this->line('Typical causes: StrictModes + a group-writable home, or a panel-managed key list instead of the file we write.');
+            $this->line('This package cannot call the DirectAdmin SSH Keys API — that needs a panel password or login key, which we do not store.');
+            $this->line('');
+            $this->info('Authorize the key in DirectAdmin:');
+            $this->line('  1. Log in to DirectAdmin');
+            $this->line('  2. Advanced Features → SSH Keys (Account Manager → SSH Keys on some skins)');
+            $this->line('  3. Add the public key below and enable Authorize / Allow login');
+        } else {
+            $this->line('Check that ~/.ssh is mode 700 and ~/.ssh/authorized_keys is mode 600, then retry.');
+            $this->line('If the home directory is group-writable, OpenSSH StrictModes will ignore authorized_keys.');
+        }
+
+        if ($publicKey) {
+            $this->line('');
+            $this->line('Public key:');
+            $this->line($publicKey);
+        }
+
+        $this->line('');
+    }
+
     protected function addDeployKeyViaAPI(string $publicKey, ?array $repoInfo = null): void
     {
         if (! $this->githubAPI) {
@@ -258,7 +305,6 @@ abstract class BaseDirectAdminCommand extends Command
         }
 
         try {
-            // Get repository information if not provided
             if (! $repoInfo) {
                 $repoInfo = $this->github->getRepositoryInfo();
                 if (! $repoInfo) {
@@ -273,21 +319,18 @@ abstract class BaseDirectAdminCommand extends Command
 
             $this->info('🔑 Adding deploy key to GitHub repository via API...');
 
-            // Check if key already exists
             if ($this->githubAPI->keyExists($owner, $repo, $publicKey)) {
                 $this->info('✅ Deploy key already exists in repository');
 
                 return;
             }
 
-            // Create deploy key
-            $this->githubAPI->createDeployKey($owner, $repo, $publicKey, 'DirectAdmin Server', false);
+            $this->githubAPI->createDeployKey($owner, $repo, $publicKey, 'Webhosting Deploy', false);
             $this->info('✅ Deploy key added successfully to repository');
         } catch (\Exception $e) {
             $this->warn('⚠️  Failed to add deploy key via API: '.$e->getMessage());
             $this->warn('   You may need to add it manually.');
 
-            // Check if key might already exist before showing manual instructions
             $repoInfoForCheck = $repoInfo ?: $this->github->getRepositoryInfo();
             $keyExists = false;
             if ($repoInfoForCheck) {
@@ -299,11 +342,10 @@ abstract class BaseDirectAdminCommand extends Command
                         return;
                     }
                 } catch (\Exception $e) {
-                    // If check fails, proceed with manual instructions
+                    // continue with manual instructions
                 }
             }
 
-            // Show manual instructions as fallback
             $this->line('');
             $this->warn('🔑 Please add this SSH key manually to your GitHub repository:');
             $this->warn('   Settings → Deploy keys → Add deploy key');
@@ -311,18 +353,13 @@ abstract class BaseDirectAdminCommand extends Command
             $this->line($publicKey);
             $this->line('');
 
-            if (method_exists($this, 'ask')) {
-                $this->ask('Press ENTER after adding the key to GitHub to continue...', '');
-            }
+            pause('Press ENTER after adding the key to GitHub to continue.');
         }
     }
 
-    /**
-     * Generate workflow content with placeholders replaced.
-     */
     protected function generateWorkflowContent(string $branch, string $phpVersion): string
     {
-        $stubPath = __DIR__.'/../../stubs/directadmin-deploy.yml';
+        $stubPath = __DIR__.'/../../stubs/webhosting-deploy.yml';
 
         if (! File::exists($stubPath)) {
             throw new \Exception("Workflow stub not found: {$stubPath}");
@@ -335,52 +372,35 @@ abstract class BaseDirectAdminCommand extends Command
         return $content;
     }
 
-    /**
-     * Get site directory from option or config.
-     */
     protected function getSiteDir(): string
     {
         if ($this->hasOption('site-dir') && $this->option('site-dir')) {
-            return $this->option('site-dir');
+            return (string) $this->option('site-dir');
         }
 
-        return config('directadmin-deploy.deployment.site_dir');
+        return (string) config('webhosting-deploy.deployment.site_dir', '');
     }
 
-    /**
-     * Get absolute path for the site directory.
-     */
-    protected function getAbsoluteSitePath(string $siteDir): string
+    protected function getAbsoluteSitePath(): string
     {
-        $username = config('directadmin-deploy.ssh.username');
-
-        return "/home/{$username}/domains/{$siteDir}/laravel_html";
+        return $this->driver()->shellAppPath();
     }
 
-    /**
-     * Test if repository is accessible via SSH (deploy key works).
-     */
     protected function testRepositoryAccess(string $repoUrl): bool
     {
         try {
-            // Test repository access using git ls-remote
-            // This is a lightweight way to verify if the deploy key has access to the repository
-            // Escape the repo URL properly
             $escapedRepoUrl = escapeshellarg($repoUrl);
             $testCommand = "git ls-remote {$escapedRepoUrl} HEAD 2>&1";
 
             try {
                 $result = $this->ssh->execute($testCommand);
 
-                // Check for successful access indicators
-                // If we get a commit hash or refs/heads/, the access works
                 if (preg_match('/^[a-f0-9]{40}\s+refs\/heads\/HEAD/', $result) ||
                     preg_match('/^[a-f0-9]{40}\s+HEAD/', $result) ||
                     stripos($result, 'refs/heads') !== false) {
                     return true;
                 }
 
-                // If no permission errors, assume it works
                 $errorIndicators = [
                     'Permission denied',
                     'repository not found',
@@ -395,11 +415,8 @@ abstract class BaseDirectAdminCommand extends Command
                     }
                 }
 
-                // If we got some output and no errors, assume it works
                 return ! empty(trim($result));
-
             } catch (\Exception $e) {
-                // Check the error message for permission issues
                 $errorMsg = $e->getMessage();
                 $errorIndicators = [
                     'Permission denied',
@@ -416,24 +433,17 @@ abstract class BaseDirectAdminCommand extends Command
                     }
                 }
 
-                // If error doesn't indicate permission issue, might be network/server issue
-                // Assume deploy key might not be set up
                 return false;
             }
         } catch (\Exception $e) {
-            // If we can't test, assume deploy key might not be set up
             return false;
         }
     }
 
-    /**
-     * Check if the exception is a git authentication error.
-     */
     protected function isGitAuthenticationError(\Exception $e): bool
     {
         $errorMessage = $e->getMessage();
 
-        // Check for common git authentication error messages
         $authErrorPatterns = [
             'Repository not found',
             'Could not read from remote repository',
@@ -452,16 +462,12 @@ abstract class BaseDirectAdminCommand extends Command
         return false;
     }
 
-    /**
-     * Display GitHub secrets and variables for manual setup.
-     */
     protected function displayGitHubSecrets(array $repoInfo): void
     {
         $this->line('');
         $this->info('🔒 GitHub Secrets and Variables Setup');
         $this->line('');
 
-        // Get private key
         $privateKey = $this->ssh->getPrivateKey();
         if (! $privateKey) {
             $this->error('❌ Could not retrieve private key from server');
@@ -469,17 +475,16 @@ abstract class BaseDirectAdminCommand extends Command
             return;
         }
 
-        // Display secrets
         $this->warn('📋 Add these secrets to your GitHub repository:');
         $this->line('Go to: '.$repoInfo['secrets_url']);
         $this->line('');
 
         $secrets = [
-            'SSH_HOST' => config('directadmin-deploy.ssh.host'),
-            'SSH_USERNAME' => config('directadmin-deploy.ssh.username'),
-            'SSH_PORT' => (string) config('directadmin-deploy.ssh.port', 22),
+            'SSH_HOST' => config('webhosting-deploy.ssh.host'),
+            'SSH_USERNAME' => config('webhosting-deploy.ssh.username'),
+            'SSH_PORT' => (string) config('webhosting-deploy.ssh.port', 22),
             'SSH_KEY' => $privateKey,
-            'WEBSITE_FOLDER' => $this->getSiteDir(),
+            'APP_PATH' => $this->driver()->relativeAppPath(),
         ];
 
         foreach ($secrets as $name => $value) {
@@ -496,42 +501,33 @@ abstract class BaseDirectAdminCommand extends Command
             $this->line('');
         }
 
-        // Display deploy key information (only if not already added)
-        // Test repository access first - if it works, deploy key is already configured
         $publicKey = $this->ssh->getPublicKey();
         if ($publicKey) {
-            // Test if we can access the repository via SSH (best way to verify deploy key works)
-            $repoUrl = $repoInfo['url'];
             $sshRepoUrl = "git@github.com:{$repoInfo['owner']}/{$repoInfo['name']}.git";
 
-            // Check if deploy key already exists via API (if available)
             $keyExists = false;
             if ($this->githubAPI) {
                 try {
                     $keyExists = $this->githubAPI->keyExists($repoInfo['owner'], $repoInfo['name'], $publicKey);
                 } catch (\Exception $e) {
-                    // If check fails, test repository access instead
+                    // fall through
                 }
             }
 
-            // If API check didn't confirm, test repository access via SSH
             if (! $keyExists) {
                 $keyExists = $this->testRepositoryAccess($sshRepoUrl);
             }
 
-            // Fallback: If API is not initialized but we might have a token, try to check via API
             if (! $keyExists && ! $this->githubAPI) {
-                $token = $this->option('token') ?: env('GITHUB_API_TOKEN');
+                $token = ($this->hasOption('token') ? $this->option('token') : null) ?: env('GITHUB_API_TOKEN');
                 if ($token) {
                     try {
-                        $tempAPI = new \ErwinLiemburg\LaravelDirectAdminDeploy\Services\GitHubAPIService($token);
+                        $tempAPI = new GitHubAPIService($token);
                         $keyExists = $tempAPI->keyExists($repoInfo['owner'], $repoInfo['name'], $publicKey);
                     } catch (\Exception $e) {
-                        // If check fails, test repository access instead
                         $keyExists = $this->testRepositoryAccess($sshRepoUrl);
                     }
                 } else {
-                    // No token available, test repository access
                     $keyExists = $this->testRepositoryAccess($sshRepoUrl);
                 }
             }
@@ -551,5 +547,13 @@ abstract class BaseDirectAdminCommand extends Command
                 $this->line('');
             }
         }
+    }
+
+    /**
+     * @param  array<string, string>  $values
+     */
+    protected function applyRemoteEnv(array $values): void
+    {
+        EnvFile::upsertRemote($this->ssh, $this->driver()->shellAppPath(), $values);
     }
 }

@@ -1,6 +1,6 @@
 <?php
 
-namespace CocomediaNL\LaravelDirectAdminDeploy\Services;
+namespace CocomediaNL\LaravelWebhostingDeploy\Services;
 
 use Exception;
 use Illuminate\Support\Facades\Http;
@@ -13,7 +13,7 @@ class GitHubAPIService
 
     public function __construct(?string $token = null)
     {
-        $this->token = $token ?: config('directadmin-deploy.github.api_token') ?: env('GITHUB_API_TOKEN');
+        $this->token = $token ?: config('webhosting-deploy.github.api_token') ?: env('GITHUB_API_TOKEN');
 
         if (! $this->token) {
             throw new Exception('GitHub API token is required. Set GITHUB_API_TOKEN in your .env file.');
@@ -193,11 +193,11 @@ class GitHubAPIService
      * @param  string  $owner  Repository owner
      * @param  string  $repo  Repository name
      * @param  string  $publicKey  The public SSH key
-     * @param  string  $title  Optional title for the deploy key (default: "DirectAdmin Server")
+     * @param  string  $title  Optional title for the deploy key (default: "Webhosting Deploy")
      * @param  bool  $readOnly  Whether the key should be read-only (default: false)
      * @return array The created deploy key data
      */
-    public function createDeployKey(string $owner, string $repo, string $publicKey, string $title = 'DirectAdmin Server', bool $readOnly = false): array
+    public function createDeployKey(string $owner, string $repo, string $publicKey, string $title = 'Webhosting Deploy', bool $readOnly = false): array
     {
         // Check if key already exists
         if ($this->keyExists($owner, $repo, $publicKey)) {
@@ -248,15 +248,47 @@ class GitHubAPIService
     public function testConnection(): bool
     {
         try {
-            $response = Http::withHeaders([
-                'Accept' => 'application/vnd.github.v3+json',
-                'Authorization' => "Bearer {$this->token}",
-                'X-GitHub-Api-Version' => '2022-11-28',
-            ])->get("{$this->baseUrl}/user");
+            $this->getAuthenticatedUser();
 
-            return $response->successful();
+            return true;
         } catch (Exception $e) {
             return false;
         }
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function getAuthenticatedUser(): array
+    {
+        $response = Http::withHeaders([
+            'Accept' => 'application/vnd.github.v3+json',
+            'Authorization' => "Bearer {$this->token}",
+            'X-GitHub-Api-Version' => '2022-11-28',
+        ])->get("{$this->baseUrl}/user");
+
+        if (! $response->successful()) {
+            throw new Exception('GitHub API authentication failed: '.$response->body());
+        }
+
+        return $response->json();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function getRepository(string $owner, string $repo): array
+    {
+        $response = Http::withHeaders([
+            'Accept' => 'application/vnd.github.v3+json',
+            'Authorization' => "Bearer {$this->token}",
+            'X-GitHub-Api-Version' => '2022-11-28',
+        ])->get("{$this->baseUrl}/repos/{$owner}/{$repo}");
+
+        if (! $response->successful()) {
+            throw new Exception("GitHub repository access failed for {$owner}/{$repo}: ".$response->body());
+        }
+
+        return $response->json();
     }
 }

@@ -1,12 +1,14 @@
 {
-	"name": "cocomedia-nl/laravel-directadmin-deploy",
-	"description": "Laravel package for automated DirectAdmin deployment with GitHub Actions support",
+	"name": "cocomedia-nl/laravel-webhosting-deploy",
+	"description": "Laravel package for automated shared webhosting deployment (DirectAdmin and TransIP) with GitHub Actions support",
 	"type": "library",
-	"version": "0.1.8",
+	"version": "0.2.0",
 	"license": "MIT",
 	"keywords": [
 		"laravel",
+		"webhosting",
 		"directadmin",
+		"transip",
 		"deployment",
 		"github-actions",
 		"ssh"
@@ -19,9 +21,10 @@
 	],
 	"require": {
 		"php": "^8.2",
-		"illuminate/support": "^11.0|^12.0|^13.0",
 		"illuminate/console": "^11.0|^12.0|^13.0",
 		"illuminate/process": "^11.0|^12.0|^13.0",
+		"illuminate/support": "^11.0|^12.0|^13.0",
+		"laravel/prompts": "^0.1.25 || ^0.2 || ^0.3",
 		"symfony/console": "^7.0"
 	},
 	"require-dev": {
@@ -30,18 +33,18 @@
 	},
 	"autoload": {
 		"psr-4": {
-			"CocomediaNL\\LaravelDirectAdminDeploy\\": "src/"
+			"CocomediaNL\\LaravelWebhostingDeploy\\": "src/"
 		}
 	},
 	"autoload-dev": {
 		"psr-4": {
-			"CocomediaNL\\LaravelDirectAdminDeploy\\Tests\\": "tests/"
+			"CocomediaNL\\LaravelWebhostingDeploy\\Tests\\": "tests/"
 		}
 	},
 	"extra": {
 		"laravel": {
 			"providers": [
-				"CocomediaNL\\LaravelDirectAdminDeploy\\DirectAdminDeployServiceProvider"
+				"CocomediaNL\\LaravelWebhostingDeploy\\WebhostingDeployServiceProvider"
 			]
 		}
 	},
